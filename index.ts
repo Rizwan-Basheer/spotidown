@@ -159,7 +159,7 @@ async function getDownloadUrl(
 
   // Extract final download URL from HTML response
   const urlMatch = trackData.data.match(
-    /href="(https:\/\/rapid\.spotidown\.app\/\?token=[^"]+)"/,
+    /href="(https:\/\/rapid\.spotidown\.app(?:\/v2)?\?token=[^"]+)"/
   );
   if (!urlMatch) {
     throw new Error("Could not find MP3 download url in Spotidown response");
