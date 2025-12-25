@@ -11,13 +11,48 @@ let page: Page | null = null;
 
 // Launch browser and page ONCE
 async function initBrowserAndPage() {
-  if (!browser)
+  if (!browser) {
+    const args = ["--no-sandbox", "--disable-setuid-sandbox"];
+    let proxyUrl = process.env.PROXY_URL;
+
+    if (proxyUrl) {
+      // Puppeteer does not support user:pass@host in --proxy-server
+      // We need to strip auth for the launch arg and use page.authenticate later
+      try {
+        const url = new URL(proxyUrl);
+        // Reconstruct URL without username/password
+        const serverUrl = `${url.protocol}//${url.host}`;
+        args.push(`--proxy-server=${serverUrl}`);
+        console.log(`Using Proxy Server: ${serverUrl}`);
+      } catch (e) {
+        console.error("Invalid Proxy URL format", e);
+      }
+    }
+
     browser = await puppeteer.launch({
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args,
     });
+  }
   if (!page) {
     page = await browser.newPage();
+
+    // Handle Proxy Authentication if provided
+    if (process.env.PROXY_URL) {
+      try {
+        const url = new URL(process.env.PROXY_URL);
+        if (url.username || url.password) {
+          await page.authenticate({
+            username: decodeURIComponent(url.username),
+            password: decodeURIComponent(url.password),
+          });
+          console.log("Proxy authentication set.");
+        }
+      } catch (e) {
+        console.error("Failed to parse proxy credentials", e);
+      }
+    }
+
     await page.goto("https://spotidown.app/", { waitUntil: "networkidle2" });
   }
 }
@@ -69,7 +104,7 @@ async function getDownloadUrl(
     // @ts-ignore
     return new Promise<string>((resolve) => {
       // @ts-ignore
-      grecaptcha.ready(function() {
+      grecaptcha.ready(function () {
         // @ts-ignore
         grecaptcha
           .execute("6LcXkaUqAAAAAGvO0z9Mg54lpG22HE4gkl3XYFTK", {
@@ -180,33 +215,23 @@ async function getDownloadUrl(
 serve({
   port: PORT,
   routes: {
+    // Original Route: Redirects to download
     "/track/:id": async (req) => {
       const trackId = req.params.id;
       if (!trackId) {
         return new Response("Track ID is required", { status: 400 });
       }
       try {
-        const {
-          url: downloadUrl,
-          name,
-          artist,
-        } = await getDownloadUrl(trackId);
-
-        // Redirect to the download URL
+        const { url: downloadUrl } = await getDownloadUrl(trackId);
         return Response.redirect(downloadUrl, 302);
-        // return new Response(
-        //   JSON.stringify({ error: false, url: downloadUrl, name, artist }),
-        //   {
-        //     headers: { "content-type": "application/json" },
-        //   },
-        // );
       } catch (err: any) {
         return new Response(
           JSON.stringify({ error: true, message: err.message }),
-          { status: 500 },
+          { status: 500, headers: { "content-type": "application/json" } }
         );
       }
     },
+    // ISRC Route
     "/isrc/:isrc": async (req) => {
       const clientId = process.env.CLIENT_ID || "";
       const clientSecret = process.env.CLIENT_SECRET || "";
@@ -214,48 +239,58 @@ serve({
       if (!isrc) {
         return new Response("ISRC is required", { status: 400 });
       }
-      const spotifyApi = new SpotifyWebApi({ clientId, clientSecret });
-      await spotifyApi
-        .clientCredentialsGrant()
-        .then((data: any) =>
-          spotifyApi.setAccessToken(data.body["access_token"]),
-        );
-      const data = await spotifyApi.searchTracks(`isrc:${isrc}`);
-      //get the fist track from the search and get its ID and get the download URL
-      if (data.body.tracks.items.length > 0) {
-        const track = data.body.tracks.items[0];
-        const trackId = track.id;
-        if (!trackId) {
-          return new Response(
-            JSON.stringify({ error: "No track found with that ISRC" }),
-            { status: 404, headers: { "content-type": "application/json" } },
-          );
-        }
-        try {
-          const {
-            url: downloadUrl,
-            name,
-            artist,
-          } = await getDownloadUrl(trackId);
-          //redirect to the download URL
+      try {
+        const spotifyApi = new SpotifyWebApi({ clientId, clientSecret });
+        const data = await spotifyApi.clientCredentialsGrant();
+        spotifyApi.setAccessToken(data.body["access_token"]);
+        const searchData = await spotifyApi.searchTracks(`isrc:${isrc}`);
 
-          // return new Response(
-          //   JSON.stringify({ error: false, url: downloadUrl, name, artist }),
-          //   { headers: { "content-type": "application/json" } },
-          // );
+        if (searchData.body.tracks?.items && searchData.body.tracks.items.length > 0) {
+          const trackId = searchData.body.tracks.items[0].id;
+          if (!trackId) return new Response(JSON.stringify({ error: "No track found" }), { status: 404 });
+
+          const { url: downloadUrl } = await getDownloadUrl(trackId);
           return Response.redirect(downloadUrl, 302);
-        } catch (err: any) {
-          return new Response(
-            JSON.stringify({ error: true, message: err.message }),
-            { status: 500 },
-          );
         }
+        return new Response(JSON.stringify({ error: "No track found" }), { status: 404 });
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({ error: true, message: err.message }),
+          { status: 500, headers: { "content-type": "application/json" } }
+        );
       }
-      return new Response(
-        JSON.stringify({ error: "No track found with that ISRC" }),
-        { status: 404, headers: { "content-type": "application/json" } },
-      );
     },
+    // NEW ROUTE: /resolve
+    "/resolve": async (req) => {
+      const url = new URL(req.url);
+      const spotifyUrl = url.searchParams.get("url");
+
+      if (!spotifyUrl) {
+        return new Response(JSON.stringify({ error: "Missing 'url' query parameter" }), {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      try {
+        let trackId = spotifyUrl;
+        const match = spotifyUrl.match(/track\/([a-zA-Z0-9]+)/);
+        if (match) {
+          trackId = match[1];
+        }
+
+        const result = await getDownloadUrl(trackId);
+        return new Response(JSON.stringify(result), {
+          headers: { "content-type": "application/json" }
+        });
+
+      } catch (err: any) {
+        return new Response(
+          JSON.stringify({ error: true, message: err.message }),
+          { status: 500, headers: { "content-type": "application/json" } }
+        );
+      }
+    }
   },
 });
 
